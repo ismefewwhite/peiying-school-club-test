@@ -1,49 +1,60 @@
 import os
-from datetime import datetime, time
+import base64
+from datetime import datetime
 from io import BytesIO
 from functools import wraps
+import pytz # 處理時區
 from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file, session
 from flask_sqlalchemy import SQLAlchemy
 import pandas as pd
 
-# 初始化 Flask 應用程式
+# 初始化 Flask
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_secret_key_here'
+app.config['SECRET_KEY'] = 'your_super_secret_key'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///school_clubs.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# 設定上傳檔案大小限制 (例如 5MB)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
 
-# --- 設定管理者帳號密碼 (您可以修改這裡) ---
+# 管理者帳號設定
 ADMIN_USERNAME = 'admin'
 ADMIN_PASSWORD = 'password123' 
 
 db = SQLAlchemy(app)
 
+# 設定台灣時區
+TAIWAN_TZ = pytz.timezone('Asia/Taipei')
+
+def get_taiwan_now():
+    """取得目前的台灣時間"""
+    return datetime.now(TAIWAN_TZ).replace(tzinfo=None)
+
 # ==========================================
-# 1. 資料庫模型 (Database Models)
+# 1. 資料庫模型
 # ==========================================
 
 class SystemConfig(db.Model):
-    """系統設定：存首頁標題、圖片等"""
     id = db.Column(db.Integer, primary_key=True)
-    site_title = db.Column(db.String(100), default="國小社團報名系統")
-    welcome_msg = db.Column(db.Text, default="歡迎各位同學參加社團活動！")
-    banner_image = db.Column(db.String(500), nullable=True) # 圖片網址
+    site_title = db.Column(db.String(100), default="快樂國小社團報名")
+    welcome_msg = db.Column(db.Text, default="歡迎選修喜歡的社團！")
+    # 這裡改成存圖片的 Base64 編碼
+    banner_image_data = db.Column(db.Text, nullable=True) 
 
 class Club(db.Model):
-    """社團資料表"""
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     description = db.Column(db.Text, nullable=True)
-    # 報名時間限制
+    # 封面圖片 Base64
+    image_data = db.Column(db.Text, nullable=True)
+    
     start_time = db.Column(db.DateTime, nullable=False)
     end_time = db.Column(db.DateTime, nullable=False)
-    # 名額限制
     max_regular = db.Column(db.Integer, default=20)
     max_waitlist = db.Column(db.Integer, default=5)
-    # --- 新增：上課時間設定 ---
-    weekday = db.Column(db.String(10), nullable=False) # 例如 "星期一"
-    class_start = db.Column(db.Time, nullable=False)   # 例如 16:00
-    class_end = db.Column(db.Time, nullable=False)     # 例如 17:30
+    
+    weekday = db.Column(db.String(10), nullable=False)
+    class_start = db.Column(db.Time, nullable=False)
+    class_end = db.Column(db.Time, nullable=False)
     
     registrations = db.relationship('Registration', backref='club', cascade="all, delete-orphan")
 
@@ -54,20 +65,18 @@ class Club(db.Model):
         return Registration.query.filter_by(club_id=self.id, status='備取').count()
 
 class Registration(db.Model):
-    """報名資料表"""
     id = db.Column(db.Integer, primary_key=True)
     club_id = db.Column(db.Integer, db.ForeignKey('club.id'), nullable=False)
     student_name = db.Column(db.String(50), nullable=False)
     student_class = db.Column(db.String(20), nullable=False)
     parent_phone = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(10), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime, default=get_taiwan_now)
 
 # ==========================================
-# 2. 輔助功能 (Helpers)
+# 2. 輔助函式
 # ==========================================
 
-# 登入檢查裝飾器
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -78,7 +87,6 @@ def login_required(f):
     return decorated_function
 
 def get_system_config():
-    """取得系統設定，如果沒有就自動建立預設值"""
     conf = SystemConfig.query.first()
     if not conf:
         conf = SystemConfig()
@@ -86,8 +94,17 @@ def get_system_config():
         db.session.commit()
     return conf
 
+def process_image_upload(file_obj):
+    """將上傳的檔案轉為 Base64 字串"""
+    if file_obj and file_obj.filename != '':
+        # 讀取檔案並轉碼
+        img_data = file_obj.read()
+        b64_str = base64.b64encode(img_data).decode('utf-8')
+        return b64_str
+    return None
+
 # ==========================================
-# 3. HTML 模板
+# 3. HTML 模板 (加入活潑設計)
 # ==========================================
 
 BASE_LAYOUT = """
@@ -98,38 +115,70 @@ BASE_LAYOUT = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ config.site_title }}</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- 加入 Google Fonts 和一些自訂 CSS -->
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&display=swap" rel="stylesheet">
     <style>
-        body { background-color: #f8f9fa; font-family: "Microsoft JhengHei", sans-serif; }
-        .container { margin-top: 30px; margin-bottom: 50px; }
-        .card { margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .club-img { height: 200px; object-fit: cover; background-color: #eee; }
-        .banner-area { 
-            background-color: #e9ecef; padding: 2rem; margin-bottom: 2rem; border-radius: .3rem; 
-            text-align: center;
+        body { 
+            background-color: #f0f8ff; /* 淡藍色背景 */
+            font-family: 'Noto Sans TC', sans-serif;
+            background-image: linear-gradient(120deg, #fdfbfb 0%, #ebedee 100%);
         }
-        .banner-img { max-width: 100%; max-height: 300px; margin-top: 15px; border-radius: 5px; }
+        .navbar {
+            background: linear-gradient(to right, #4facfe 0%, #00f2fe 100%); /* 漸層導覽列 */
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .navbar-brand { font-weight: 700; letter-spacing: 1px; color: white !important; }
+        .card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+            transition: transform 0.3s ease;
+            overflow: hidden;
+        }
+        .card:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.1); }
+        .btn-primary {
+            background-color: #4facfe; border: none;
+            border-radius: 50px; padding: 10px 20px;
+        }
+        .btn-primary:hover { background-color: #00f2fe; }
+        
+        .banner-area {
+            background: white; border-radius: 20px; padding: 2rem;
+            margin-bottom: 2rem; text-align: center;
+            box-shadow: 0 10px 25px rgba(100, 100, 100, 0.1);
+        }
+        .banner-img {
+            max-width: 100%; max-height: 350px;
+            border-radius: 15px; margin-top: 15px;
+            object-fit: cover;
+        }
+        .club-cover {
+            height: 180px; width: 100%; object-fit: cover;
+            background-color: #e9ecef;
+        }
+        .status-badge { position: absolute; top: 10px; right: 10px; font-weight: bold; }
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
-        <div class="container-fluid">
+    <nav class="navbar navbar-expand-lg navbar-dark mb-4">
+        <div class="container">
             <a class="navbar-brand" href="/">🏫 {{ config.site_title }}</a>
-            <div class="d-flex">
+            <div class="ms-auto">
                 {% if session.get('logged_in') %}
-                    <a href="/admin" class="btn btn-warning btn-sm me-2">⚙️ 管理後台</a>
-                    <a href="/logout" class="btn btn-outline-light btn-sm">登出</a>
+                    <a href="/admin" class="btn btn-warning btn-sm fw-bold shadow-sm">⚙️ 管理後台</a>
+                    <a href="/logout" class="btn btn-light btn-sm ms-2 text-primary fw-bold">登出</a>
                 {% else %}
-                    <a href="/login" class="btn btn-outline-light btn-sm">管理者登入</a>
+                    <a href="/login" class="btn btn-outline-light btn-sm fw-bold">🔒 管理者登入</a>
                 {% endif %}
             </div>
         </div>
     </nav>
     
-    <div class="container">
+    <div class="container pb-5">
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
             {% for category, message in messages %}
-              <div class="alert alert-{{ category }}">{{ message }}</div>
+              <div class="alert alert-{{ category }} shadow-sm rounded-pill px-4">{{ message }}</div>
             {% endfor %}
           {% endif %}
         {% endwith %}
@@ -144,23 +193,21 @@ BASE_LAYOUT = """
 """
 
 LOGIN_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
-<div class="row justify-content-center">
+<div class="row justify-content-center align-items-center" style="min-height: 60vh;">
     <div class="col-md-4">
-        <div class="card">
-            <div class="card-header bg-primary text-white">管理者登入</div>
-            <div class="card-body">
-                <form method="POST">
-                    <div class="mb-3">
-                        <label>帳號</label>
-                        <input type="text" name="username" class="form-control" required>
-                    </div>
-                    <div class="mb-3">
-                        <label>密碼</label>
-                        <input type="password" name="password" class="form-control" required>
-                    </div>
-                    <button type="submit" class="btn btn-primary w-100">登入</button>
-                </form>
-            </div>
+        <div class="card p-4">
+            <h3 class="text-center mb-4 text-primary fw-bold">管理者登入</h3>
+            <form method="POST">
+                <div class="mb-3">
+                    <label class="fw-bold text-secondary">帳號</label>
+                    <input type="text" name="username" class="form-control form-control-lg bg-light" required>
+                </div>
+                <div class="mb-4">
+                    <label class="fw-bold text-secondary">密碼</label>
+                    <input type="password" name="password" class="form-control form-control-lg bg-light" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100 btn-lg shadow">確認登入</button>
+            </form>
         </div>
     </div>
 </div>
@@ -168,90 +215,117 @@ LOGIN_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
 
 HOME_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
 <div class="banner-area">
-    <h1 class="display-5">{{ config.site_title }}</h1>
-    <p class="lead">{{ config.welcome_msg | safe }}</p>
-    {% if config.banner_image %}
-        <img src="{{ config.banner_image }}" class="banner-img">
+    <h1 class="fw-bold text-primary mb-3">{{ config.site_title }}</h1>
+    <div class="lead text-secondary mb-3">{{ config.welcome_msg | safe }}</div>
+    {% if config.banner_image_data %}
+        <img src="data:image/jpeg;base64,{{ config.banner_image_data }}" class="banner-img shadow">
     {% endif %}
 </div>
 
-<h3 class="mb-3 border-start border-5 border-primary ps-2">目前開放報名的社團</h3>
-<div class="row">
+<div class="d-flex align-items-center mb-4">
+    <div class="bg-primary rounded-pill" style="width: 5px; height: 30px; margin-right: 10px;"></div>
+    <h3 class="m-0 fw-bold text-dark">熱門社團一覽</h3>
+</div>
+
+<div class="row g-4">
     {% for club in clubs %}
     <div class="col-md-6 col-lg-4">
         <div class="card h-100">
+            <!-- 封面圖片 -->
+            {% if club.image_data %}
+                <img src="data:image/jpeg;base64,{{ club.image_data }}" class="club-cover">
+            {% else %}
+                <div class="club-cover d-flex align-items-center justify-content-center text-muted bg-light">
+                    (無封面圖片)
+                </div>
+            {% endif %}
+            
+            <span class="badge bg-warning text-dark status-badge shadow-sm">
+                {{ club.weekday }} {{ club.class_start.strftime('%H:%M') }}
+            </span>
+
             <div class="card-body">
-                <h5 class="card-title fw-bold">{{ club.name }}</h5>
-                <span class="badge bg-info text-dark mb-2">
-                    {{ club.weekday }} {{ club.class_start.strftime('%H:%M') }}-{{ club.class_end.strftime('%H:%M') }}
-                </span>
-                <p class="card-text mt-2 text-muted small">
-                    報名期限：{{ club.end_time.strftime('%m/%d %H:%M') }} 截止
+                <h4 class="card-title fw-bold">{{ club.name }}</h4>
+                <p class="text-muted small mb-2">
+                    <i class="bi bi-clock"></i> 報名截止：{{ club.end_time.strftime('%m/%d %H:%M') }}
                 </p>
-                <div class="d-flex justify-content-between text-center mb-3 border p-2 rounded bg-light">
+                <div class="d-flex justify-content-between text-center my-3 p-2 rounded bg-light border">
                     <div>
-                        <div class="fw-bold text-success">{{ club.current_regular_count() }}/{{ club.max_regular }}</div>
-                        <small>正取</small>
+                        <span class="d-block fw-bold text-success fs-5">{{ club.current_regular_count() }}/{{ club.max_regular }}</span>
+                        <small class="text-muted">正取名額</small>
                     </div>
+                    <div class="border-start"></div>
                     <div>
-                        <div class="fw-bold text-secondary">{{ club.current_waitlist_count() }}/{{ club.max_waitlist }}</div>
-                        <small>備取</small>
+                        <span class="d-block fw-bold text-secondary fs-5">{{ club.current_waitlist_count() }}/{{ club.max_waitlist }}</span>
+                        <small class="text-muted">備取名額</small>
                     </div>
                 </div>
-                <a href="/club/{{ club.id }}" class="btn btn-primary w-100">查看詳情與報名</a>
+                <a href="/club/{{ club.id }}" class="btn btn-outline-primary w-100 fw-bold rounded-pill">👉 查看詳情 & 報名</a>
             </div>
         </div>
     </div>
     {% else %}
-    <div class="col-12 text-center py-5 text-muted">目前沒有開放的社團。</div>
+    <div class="col-12 text-center py-5">
+        <h4 class="text-muted">目前沒有開放的社團 🐢</h4>
+    </div>
     {% endfor %}
 </div>
 """)
 
 CLUB_DETAIL_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
 <div class="row">
-    <div class="col-md-8">
+    <div class="col-lg-8 mb-4">
         <div class="card h-100">
-            <div class="card-header bg-white d-flex justify-content-between align-items-center">
-                <h3 class="m-0">{{ club.name }}</h3>
-                <span class="badge bg-primary fs-6">
-                    {{ club.weekday }} {{ club.class_start.strftime('%H:%M') }} ~ {{ club.class_end.strftime('%H:%M') }}
-                </span>
-            </div>
-            <div class="card-body">
-                <div class="club-description">
+            {% if club.image_data %}
+                <img src="data:image/jpeg;base64,{{ club.image_data }}" style="height: 300px; object-fit: cover;">
+            {% endif %}
+            <div class="card-body p-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h2 class="fw-bold text-primary mb-0">{{ club.name }}</h2>
+                    <span class="badge bg-info text-dark fs-6 shadow-sm">
+                        {{ club.weekday }} {{ club.class_start.strftime('%H:%M') }} - {{ club.class_end.strftime('%H:%M') }}
+                    </span>
+                </div>
+                <hr>
+                <h5 class="fw-bold text-secondary mb-3">社團介紹</h5>
+                <div class="club-description lh-lg">
                     {{ club.description | safe }}
                 </div>
             </div>
         </div>
     </div>
-    <div class="col-md-4">
-        <div class="card">
-            <div class="card-header bg-info text-white fw-bold">學生報名表</div>
-            <div class="card-body">
+    <div class="col-lg-4">
+        <div class="card border-0 shadow sticky-top" style="top: 20px;">
+            <div class="card-header bg-primary text-white text-center py-3">
+                <h5 class="m-0 fw-bold">📝 學生報名表</h5>
+            </div>
+            <div class="card-body p-4 bg-light">
                 {% if can_register %}
-                    <div class="alert alert-light border mb-3 small">
-                        請確認上課時間不會與其他社團衝突。
+                    <div class="alert alert-info small border-0 shadow-sm">
+                        👋 現在是台灣時間 <b>{{ now_str }}</b><br>
+                        請確認時間不衝突再報名喔！
                     </div>
                     <form action="/register/{{ club.id }}" method="POST">
                         <div class="mb-3">
-                            <label class="form-label">學生姓名</label>
-                            <input type="text" name="student_name" class="form-control" required placeholder="例如：王小明">
+                            <label class="form-label fw-bold">學生姓名</label>
+                            <input type="text" name="student_name" class="form-control rounded-pill" required placeholder="例如：王小明">
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">班級座號</label>
-                            <input type="text" name="student_class" class="form-control" required placeholder="例如：60105">
+                            <label class="form-label fw-bold">班級座號</label>
+                            <input type="text" name="student_class" class="form-control rounded-pill" required placeholder="例如：60105">
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">家長聯絡電話</label>
-                            <input type="tel" name="parent_phone" class="form-control" required>
+                            <label class="form-label fw-bold">家長電話</label>
+                            <input type="tel" name="parent_phone" class="form-control rounded-pill" required>
                         </div>
-                        <button type="submit" class="btn btn-success w-100 py-2 fw-bold">確認報名</button>
+                        <button type="submit" class="btn btn-success w-100 py-2 fw-bold rounded-pill shadow">確認報名</button>
                     </form>
                 {% else %}
-                    <div class="alert alert-warning text-center">
-                        <h4>🔒 無法報名</h4>
-                        <p>{{ status_message }}</p>
+                    <div class="text-center py-4">
+                        <div class="display-1 mb-3">🔒</div>
+                        <h4 class="text-danger fw-bold">無法報名</h4>
+                        <p class="text-muted">{{ status_message }}</p>
+                        <small class="text-muted">現在時間：{{ now_str }}</small>
                     </div>
                 {% endif %}
             </div>
@@ -262,139 +336,162 @@ CLUB_DETAIL_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", 
 
 ADMIN_DASHBOARD_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h2>⚙️ 管理者後台</h2>
+    <h2 class="fw-bold text-dark">⚙️ 管理者後台</h2>
     <div>
-        <a href="/admin/config" class="btn btn-info me-2">🏠 編輯首頁設定</a>
-        <a href="/admin/create" class="btn btn-success">+ 新增社團</a>
+        <a href="/admin/config" class="btn btn-info text-white fw-bold me-2 shadow-sm">🏠 設定首頁</a>
+        <a href="/admin/create" class="btn btn-success fw-bold shadow-sm">+ 新增社團</a>
     </div>
 </div>
-<table class="table table-hover bg-white shadow-sm rounded">
-    <thead class="table-dark">
-        <tr>
-            <th>社團名稱</th>
-            <th>上課時間</th>
-            <th>報名狀況 (正/備)</th>
-            <th>功能</th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for club in clubs %}
-        <tr>
-            <td>{{ club.name }}</td>
-            <td>{{ club.weekday }} {{ club.class_start.strftime('%H:%M') }}</td>
-            <td>
-                <span class="text-success fw-bold">{{ club.current_regular_count() }}/{{ club.max_regular }}</span> | 
-                <span class="text-secondary">{{ club.current_waitlist_count() }}/{{ club.max_waitlist }}</span>
-            </td>
-            <td>
-                <a href="/admin/export/{{ club.id }}" class="btn btn-sm btn-outline-success">📥 匯出名單</a>
-                <a href="/admin/delete/{{ club.id }}" class="btn btn-sm btn-outline-danger" onclick="return confirm('確定刪除？資料無法復原喔！')">🗑️ 刪除</a>
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
+
+<div class="card p-0 overflow-hidden shadow">
+    <table class="table table-hover mb-0 align-middle">
+        <thead class="bg-dark text-white">
+            <tr>
+                <th class="py-3 ps-4">社團名稱</th>
+                <th>上課時間</th>
+                <th>報名狀況 (正/備)</th>
+                <th class="text-end pe-4">功能操作</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for club in clubs %}
+            <tr>
+                <td class="ps-4 fw-bold">{{ club.name }}</td>
+                <td><span class="badge bg-light text-dark border">{{ club.weekday }} {{ club.class_start.strftime('%H:%M') }}</span></td>
+                <td>
+                    <span class="text-success fw-bold">{{ club.current_regular_count() }}/{{ club.max_regular }}</span>
+                    <span class="text-muted mx-1">|</span>
+                    <span class="text-secondary fw-bold">{{ club.current_waitlist_count() }}/{{ club.max_waitlist }}</span>
+                </td>
+                <td class="text-end pe-4">
+                    <a href="/admin/edit/{{ club.id }}" class="btn btn-sm btn-warning fw-bold text-dark me-1">✏️ 編輯</a>
+                    <a href="/admin/export/{{ club.id }}" class="btn btn-sm btn-outline-success fw-bold me-1">📥 名單</a>
+                    <a href="/admin/delete/{{ club.id }}" class="btn btn-sm btn-outline-danger fw-bold" onclick="return confirm('確定刪除？')">🗑️</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
 """)
 
-ADMIN_CONFIG_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
-<h2 class="mb-4">🏠 編輯首頁與網站設定</h2>
-<form method="POST" class="card p-4">
-    <div class="mb-3">
-        <label class="form-label">網站標題</label>
-        <input type="text" name="site_title" class="form-control" value="{{ config.site_title }}" required>
-    </div>
-    <div class="mb-3">
-        <label class="form-label">首頁圖片網址 (Banner Image URL)</label>
-        <input type="text" name="banner_image" class="form-control" value="{{ config.banner_image or '' }}" placeholder="請貼上圖片連結，例如 https://example.com/image.jpg">
-        <div class="form-text">建議先將圖片上傳到 Imgur 或學校網站，再貼上網址。</div>
-    </div>
-    <div class="mb-3">
-        <label class="form-label">首頁歡迎詞 (支援 HTML/圖片)</label>
-        <textarea name="welcome_msg" id="editor">{{ config.welcome_msg }}</textarea>
-    </div>
-    <button type="submit" class="btn btn-primary">儲存設定</button>
-    <a href="/admin" class="btn btn-secondary">返回</a>
-</form>
-<script>
-    ClassicEditor.create(document.querySelector('#editor')).catch(error => console.error(error));
-</script>
-""")
-
-ADMIN_CREATE_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
-<h2 class="mb-4">新增社團</h2>
-<form action="/admin/create" method="POST" class="card p-4">
+# 表單共用模板 (新增/編輯)
+FORM_TEMPLATE_CONTENT = """
+<h2 class="mb-4 fw-bold">{{ title }}</h2>
+<form method="POST" enctype="multipart/form-data" class="card p-4 shadow-sm border-0">
     <div class="row">
         <div class="col-md-6 mb-3">
-            <label class="form-label">社團名稱</label>
-            <input type="text" name="name" class="form-control" required placeholder="例如：週一樂高社">
+            <label class="form-label fw-bold">社團名稱</label>
+            <input type="text" name="name" class="form-control" value="{{ club.name if club else '' }}" required>
         </div>
         <div class="col-md-3 mb-3">
-            <label class="form-label">正取名額</label>
-            <input type="number" name="max_regular" class="form-control" value="20" required>
+            <label class="form-label fw-bold">正取名額</label>
+            <input type="number" name="max_regular" class="form-control" value="{{ club.max_regular if club else 20 }}" required>
         </div>
         <div class="col-md-3 mb-3">
-            <label class="form-label">備取名額</label>
-            <input type="number" name="max_waitlist" class="form-control" value="5" required>
+            <label class="form-label fw-bold">備取名額</label>
+            <input type="number" name="max_waitlist" class="form-control" value="{{ club.max_waitlist if club else 5 }}" required>
         </div>
     </div>
 
-    <h5 class="mt-3 text-primary border-bottom pb-2">🕒 上課時段設定 (用於衝堂檢查)</h5>
-    <div class="row bg-light p-3 rounded mb-3">
+    <!-- 圖片上傳區 -->
+    <div class="mb-4 p-3 bg-light rounded border">
+        <label class="form-label fw-bold text-primary">🖼️ 社團封面圖片 (直接上傳)</label>
+        <input type="file" name="image_file" class="form-control" accept="image/*">
+        {% if club and club.image_data %}
+            <div class="mt-2 text-muted small">目前已有圖片，若不修改請留空。</div>
+        {% endif %}
+    </div>
+
+    <h5 class="mt-2 text-primary border-bottom pb-2 fw-bold">🕒 上課時段 (衝堂檢查用)</h5>
+    <div class="row mb-3">
         <div class="col-md-4 mb-3">
-            <label class="form-label">上課日</label>
+            <label class="form-label fw-bold">上課日</label>
             <select name="weekday" class="form-select" required>
-                <option value="星期一">星期一</option>
-                <option value="星期二">星期二</option>
-                <option value="星期三">星期三</option>
-                <option value="星期四">星期四</option>
-                <option value="星期五">星期五</option>
-                <option value="星期六">星期六</option>
-                <option value="星期日">星期日</option>
+                {% for day in ['星期一','星期二','星期三','星期四','星期五','星期六','星期日'] %}
+                    <option value="{{ day }}" {% if club and club.weekday == day %}selected{% endif %}>{{ day }}</option>
+                {% endfor %}
             </select>
         </div>
         <div class="col-md-4 mb-3">
-            <label class="form-label">上課開始時間</label>
-            <input type="time" name="class_start" class="form-control" required>
+            <label class="form-label fw-bold">開始時間</label>
+            <input type="time" name="class_start" class="form-control" value="{{ club.class_start.strftime('%H:%M') if club else '' }}" required>
         </div>
         <div class="col-md-4 mb-3">
-            <label class="form-label">上課結束時間</label>
-            <input type="time" name="class_end" class="form-control" required>
+            <label class="form-label fw-bold">結束時間</label>
+            <input type="time" name="class_end" class="form-control" value="{{ club.class_end.strftime('%H:%M') if club else '' }}" required>
         </div>
     </div>
 
-    <h5 class="mt-3 text-primary border-bottom pb-2">📅 報名期間設定</h5>
+    <h5 class="mt-2 text-primary border-bottom pb-2 fw-bold">📅 報名開放期間</h5>
     <div class="row">
         <div class="col-md-6 mb-3">
-            <label class="form-label">開始報名時間</label>
-            <input type="datetime-local" name="start_time" class="form-control" required>
+            <label class="form-label fw-bold">開放報名</label>
+            <!-- 注意：datetime-local 需要 YYYY-MM-DDTHH:MM 格式 -->
+            <input type="datetime-local" name="start_time" class="form-control" 
+                   value="{{ club.start_time.strftime('%Y-%m-%dT%H:%M') if club else '' }}" required>
         </div>
         <div class="col-md-6 mb-3">
-            <label class="form-label">結束報名時間</label>
-            <input type="datetime-local" name="end_time" class="form-control" required>
+            <label class="form-label fw-bold">截止報名</label>
+            <input type="datetime-local" name="end_time" class="form-control" 
+                   value="{{ club.end_time.strftime('%Y-%m-%dT%H:%M') if club else '' }}" required>
         </div>
     </div>
     
     <div class="mb-3">
-        <label class="form-label">詳細介紹 (可貼上圖片、表格)</label>
-        <textarea name="description" id="editor"></textarea>
+        <label class="form-label fw-bold">詳細介紹</label>
+        <textarea name="description" id="editor">{{ club.description if club else '' }}</textarea>
     </div>
-    <button type="submit" class="btn btn-primary btn-lg">發布社團</button>
-    <a href="/admin" class="btn btn-secondary btn-lg">取消</a>
+    <div class="d-flex gap-2">
+        <button type="submit" class="btn btn-primary btn-lg flex-grow-1 shadow">儲存設定</button>
+        <a href="/admin" class="btn btn-secondary btn-lg shadow">取消</a>
+    </div>
 </form>
-
 <script>
     ClassicEditor.create(document.querySelector('#editor')).catch(error => console.error(error));
 </script>
-<style> .ck-editor__editable_inline { min-height: 300px; } </style>
+<style> .ck-editor__editable_inline { min-height: 250px; } </style>
+"""
+
+ADMIN_FORM_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", FORM_TEMPLATE_CONTENT)
+
+ADMIN_CONFIG_TEMPLATE = BASE_LAYOUT.replace("{% block content %}{% endblock %}", """
+<h2 class="mb-4 fw-bold text-primary">🏠 設定首頁與公告</h2>
+<form method="POST" enctype="multipart/form-data" class="card p-4 shadow-sm border-0">
+    <div class="mb-3">
+        <label class="form-label fw-bold">網站標題</label>
+        <input type="text" name="site_title" class="form-control form-control-lg" value="{{ config.site_title }}" required>
+    </div>
+    
+    <div class="mb-4 p-3 bg-light rounded border">
+        <label class="form-label fw-bold text-primary">🖼️ 首頁橫幅圖片 (Banner)</label>
+        <input type="file" name="banner_file" class="form-control" accept="image/*">
+        {% if config.banner_image_data %}
+            <div class="mt-2">
+                <small class="text-muted">目前預覽：</small><br>
+                <img src="data:image/jpeg;base64,{{ config.banner_image_data }}" style="height: 100px; border-radius: 10px;">
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="mb-3">
+        <label class="form-label fw-bold">歡迎詞 / 公告 (可編輯樣式)</label>
+        <textarea name="welcome_msg" id="editor">{{ config.welcome_msg }}</textarea>
+    </div>
+    <button type="submit" class="btn btn-primary btn-lg shadow">儲存設定</button>
+    <a href="/admin" class="btn btn-secondary btn-lg shadow">返回</a>
+</form>
+<script>
+    ClassicEditor.create(document.querySelector('#editor')).catch(error => console.error(error));
+</script>
 """)
 
 # ==========================================
-# 4. 路由與核心邏輯
+# 4. 路由與邏輯
 # ==========================================
 
 @app.context_processor
 def inject_config():
-    """讓所有頁面都能讀取系統設定"""
     return dict(config=get_system_config())
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -422,7 +519,9 @@ def index():
 @app.route('/club/<int:club_id>')
 def club_detail(club_id):
     club = Club.query.get_or_404(club_id)
-    now = datetime.now()
+    # 使用台灣時間
+    now = get_taiwan_now()
+    now_str = now.strftime('%Y-%m-%d %H:%M')
     
     can_register = True
     status_message = ""
@@ -440,12 +539,12 @@ def club_detail(club_id):
             can_register = False
             status_message = "名額已額滿"
 
-    return render_template_string(CLUB_DETAIL_TEMPLATE, club=club, can_register=can_register, status_message=status_message)
+    return render_template_string(CLUB_DETAIL_TEMPLATE, club=club, can_register=can_register, status_message=status_message, now_str=now_str)
 
 @app.route('/register/<int:club_id>', methods=['POST'])
 def register_student(club_id):
     club = Club.query.get_or_404(club_id)
-    now = datetime.now()
+    now = get_taiwan_now() # 使用台灣時間
 
     if not (club.start_time <= now <= club.end_time):
         flash('不在報名時間範圍內，報名失敗。', 'danger')
@@ -455,26 +554,22 @@ def register_student(club_id):
     student_class = request.form.get('student_class')
     parent_phone = request.form.get('parent_phone')
 
-    # --- 1. 檢查是否重複報名同一個社團 ---
+    # 重複報名檢查
     existing = Registration.query.filter_by(club_id=club_id, student_class=student_class).first()
     if existing:
         flash('您已經報名過此社團了！', 'warning')
         return redirect(url_for('club_detail', club_id=club_id))
 
-    # --- 2. 衝堂檢查 (Time Conflict Check) ---
-    # 找出該學生已報名的所有社團 (且狀態不是取消)
+    # 衝堂檢查
     student_regs = Registration.query.filter_by(student_class=student_class).all()
     for reg in student_regs:
         existing_club = reg.club
-        # 如果星期相同
         if existing_club.weekday == club.weekday:
-            # 檢查時間是否有重疊
-            # 邏輯：(新開始 < 舊結束) AND (新結束 > 舊開始) 代表有重疊
             if (club.class_start < existing_club.class_end) and (club.class_end > existing_club.class_start):
                 flash(f'❌ 報名失敗！與已報名的【{existing_club.name}】上課時間衝突。', 'danger')
                 return redirect(url_for('club_detail', club_id=club_id))
 
-    # --- 3. 正取/備取判定 ---
+    # 正取/備取判定
     status = None
     current_reg = club.current_regular_count()
     current_wait = club.current_waitlist_count()
@@ -498,12 +593,12 @@ def register_student(club_id):
 
     return redirect(url_for('club_detail', club_id=club_id))
 
-# --- 管理者路由 ---
+# --- 管理者後台 ---
 
 @app.route('/admin')
 @login_required
 def admin_dashboard():
-    clubs = Club.query.all()
+    clubs = Club.query.order_by(Club.weekday, Club.class_start).all()
     return render_template_string(ADMIN_DASHBOARD_TEMPLATE, clubs=clubs)
 
 @app.route('/admin/config', methods=['GET', 'POST'])
@@ -513,7 +608,13 @@ def admin_config():
     if request.method == 'POST':
         conf.site_title = request.form.get('site_title')
         conf.welcome_msg = request.form.get('welcome_msg')
-        conf.banner_image = request.form.get('banner_image')
+        
+        # 處理圖片上傳
+        file = request.files.get('banner_file')
+        b64_img = process_image_upload(file)
+        if b64_img:
+            conf.banner_image_data = b64_img
+            
         db.session.commit()
         flash('網站設定已更新', 'success')
         return redirect(url_for('admin_config'))
@@ -524,13 +625,16 @@ def admin_config():
 def admin_create():
     if request.method == 'POST':
         try:
-            # 時間處理
             c_start = datetime.strptime(request.form.get('class_start'), '%H:%M').time()
             c_end = datetime.strptime(request.form.get('class_end'), '%H:%M').time()
+            
+            # 圖片處理
+            img_data = process_image_upload(request.files.get('image_file'))
             
             new_club = Club(
                 name=request.form.get('name'),
                 description=request.form.get('description'),
+                image_data=img_data,
                 start_time=datetime.strptime(request.form.get('start_time'), '%Y-%m-%dT%H:%M'),
                 end_time=datetime.strptime(request.form.get('end_time'), '%Y-%m-%dT%H:%M'),
                 max_regular=int(request.form.get('max_regular')),
@@ -544,9 +648,40 @@ def admin_create():
             flash('社團新增成功！', 'success')
             return redirect(url_for('admin_dashboard'))
         except Exception as e:
-            flash(f'新增失敗，請檢查欄位格式: {str(e)}', 'danger')
+            flash(f'新增失敗: {str(e)}', 'danger')
 
-    return render_template_string(ADMIN_CREATE_TEMPLATE)
+    return render_template_string(ADMIN_FORM_TEMPLATE, title="新增社團", club=None)
+
+# --- 新增功能：編輯社團 ---
+@app.route('/admin/edit/<int:club_id>', methods=['GET', 'POST'])
+@login_required
+def admin_edit(club_id):
+    club = Club.query.get_or_404(club_id)
+    
+    if request.method == 'POST':
+        try:
+            club.name = request.form.get('name')
+            club.description = request.form.get('description')
+            club.max_regular = int(request.form.get('max_regular'))
+            club.max_waitlist = int(request.form.get('max_waitlist'))
+            club.start_time = datetime.strptime(request.form.get('start_time'), '%Y-%m-%dT%H:%M')
+            club.end_time = datetime.strptime(request.form.get('end_time'), '%Y-%m-%dT%H:%M')
+            club.weekday = request.form.get('weekday')
+            club.class_start = datetime.strptime(request.form.get('class_start'), '%H:%M').time()
+            club.class_end = datetime.strptime(request.form.get('class_end'), '%H:%M').time()
+            
+            # 只有當使用者有上傳新圖片時，才更新圖片
+            new_img = process_image_upload(request.files.get('image_file'))
+            if new_img:
+                club.image_data = new_img
+                
+            db.session.commit()
+            flash('社團修改成功！', 'success')
+            return redirect(url_for('admin_dashboard'))
+        except Exception as e:
+            flash(f'修改失敗: {str(e)}', 'danger')
+            
+    return render_template_string(ADMIN_FORM_TEMPLATE, title=f"編輯社團：{club.name}", club=club)
 
 @app.route('/admin/delete/<int:club_id>')
 @login_required
@@ -561,15 +696,24 @@ def admin_delete(club_id):
 @login_required
 def admin_export(club_id):
     club = Club.query.get_or_404(club_id)
+    # 使用 pytz 轉換時間顯示
     regs = Registration.query.filter_by(club_id=club_id).all()
     data = []
     for r in regs:
+        # 將資料庫時間 (UTC 或 Naive) 轉換為台灣時間字串
+        local_time = r.created_at
+        if local_time.tzinfo is None:
+             # 假設存入時是台灣時間
+             pass 
+        else:
+            local_time = local_time.astimezone(TAIWAN_TZ)
+            
         data.append({
             "班級座號": r.student_class,
             "學生姓名": r.student_name,
             "家長電話": r.parent_phone,
             "報名狀態": r.status,
-            "報名時間": r.created_at.strftime('%Y-%m-%d %H:%M:%S')
+            "報名時間": local_time.strftime('%Y-%m-%d %H:%M:%S')
         })
     df = pd.DataFrame(data)
     output = BytesIO()
@@ -581,6 +725,5 @@ def admin_export(club_id):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        # 初始化系統設定
         get_system_config()
     app.run(debug=True)
