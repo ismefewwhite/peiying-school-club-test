@@ -722,8 +722,10 @@ def admin_export(club_id):
     output.seek(0)
     return send_file(output, as_attachment=True, download_name=f"{club.name}_名單.xlsx")
 
+# --- 這裡是最重要的修正！ (Ensure tables are created in production) ---
+with app.app_context():
+    db.create_all()
+    get_system_config()
+
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-        get_system_config()
     app.run(debug=True)
